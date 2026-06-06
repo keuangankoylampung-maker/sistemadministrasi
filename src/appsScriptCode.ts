@@ -168,7 +168,7 @@ function generateBulananTagihan(targetBulanTahun) {
  * Supports partial (instalment) payments & overpayment protections
  * ==============================================================================
  */
-function prosesPembayaran(nisn, idTagihan, jumlahBayar, metodeBayar, penerima, keterangan) {
+function prosesPembayaran(nisn, idTagihan, jumlahBayar, metodeBayar, penerima, keterangan, tanggalManual) {
   // Validasi Parameter Dasar
   if (!nisn || !idTagihan || !jumlahBayar || jumlahBayar <= 0) {
     throw new Error("Parameter tidak lengkap! Pastikan NISN, ID Tagihan, dan Jumlah Pembayaran valid.");
@@ -242,7 +242,7 @@ function prosesPembayaran(nisn, idTagihan, jumlahBayar, metodeBayar, penerima, k
   }
 
   const tanggalSekarang = new Date();
-  const formatTanggalLokal = Utilities.formatDate(tanggalSekarang, "GMT+7", "yyyy-MM-dd HH:mm:ss");
+  const formatTanggalLokal = tanggalManual || Utilities.formatDate(tanggalSekarang, "GMT+7", "yyyy-MM-dd HH:mm:ss");
 
   // 4. Update data baris tagihan di Sheet 'Tagihan_Bulanan' (Sekali panggil)
   sheetTagihan.getRange(barisTargetIndex, idxTelahBayar + 1).setValue(jumlahBayarBaru);
@@ -286,6 +286,118 @@ function prosesPembayaran(nisn, idTagihan, jumlahBayar, metodeBayar, penerima, k
     statusBayar: statusBaru,
     pdfUrl: pdfUrl
   };
+}
+
+
+/**
+ * ==============================================================================
+ * D. PEMBATALAN PEMBAYARAN & VOID KUITANSI
+ * Membatalkan transaksi kuitansi pembayaran untuk mengoreksi kesalahan input.
+ * Mengembalikan status & tunggakan tagihan semula, serta menghapus log.
+ * ==============================================================================
+ */
+function voidPembayaran(noKuitansi) {
+  if (!noKuitansi) {
+    throw new Error("Nomor Kuitansi diperlukan untuk proses pembatalan.");
+  }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheetTagihan = ss.getSheetByName("Tagihan_Bulanan");
+  const sheetLog = ss.getSheetByName("Log_Pembayaran");
+
+  if (!sheetTagihan || !sheetLog) {
+    throw new Error("Gagal menemukan Sheet 'Tagihan_Bulanan' atau 'Log_Pembayaran'.");
+  }
+
+  // 1. Ambil semua log pembayaran
+  const logData = sheetLog.getDataRange().getValues();
+  if (logData.length <= 1) {
+    throw new Error("Log pembayaran masih kosong.");
+  }
+
+  const headerLog = logData[0];
+  const idxLogKwt = headerLog.indexOf("No_Kuitansi");
+  const idxLogIdTagihan = headerLog.indexOf("ID_Tagihan");
+  const idxLogBayar = headerLog.indexOf("Jumlah_Bayar");
+
+  if (idxLogKwt === -1 || idxLogIdTagihan === -1 || idxLogBayar === -1) {
+    throw new Error("Struktur kolom Log_Pembayaran tidak sesuai!");
+  }
+
+  // Cari semua baris log yang sesuai dengan noKuitansi
+  const logsToRevert = [];
+  for (let i = 1; i < logData.length; i++) {
+    if (logData[i][idxLogKwt].toString().trim() === noKuitansi.toString().trim()) {
+      logsToRevert.push({
+        rowIndex: i + 1, // 1-indexed
+        idTagihan: logData[i][idxLogIdTagihan].toString().trim(),
+        jumlahBayar: Number(logData[i][idxLogBayar]) || 0
+      });
+    }
+  }
+
+  if (logsToRevert.length === 0) {
+    throw new Error("Kuitansi " + noKuitansi + " tidak ditemukan di Log_Pembayaran.");
+  }
+
+  // 2. Ambil data Tagihan_Bulanan
+  const tagihanData = sheetTagihan.getDataRange().getValues();
+  const headerTagihan = tagihanData[0];
+  const idxTglId = headerTagihan.indexOf("ID_Tagihan");
+  const idxTglNominal = headerTagihan.indexOf("Nominal_Tagihan");
+  const idxTglBayar = headerTagihan.indexOf("Jumlah_Bayar");
+  const idxTglSisa = headerTagihan.indexOf("Sisa_Tunggakan");
+  const idxTglStatus = headerTagihan.indexOf("Status");
+
+  if (idxTglId === -1 || idxTglBayar === -1 || idxTglSisa === -1 || idxTglStatus === -1) {
+    throw new Error("Struktur kolom Tagihan_Bulanan tidak sesuai!");
+  }
+
+  // Update tagihan untuk setiap log yang akan dinonaktifkan
+  for (let r = 0; r < logsToRevert.length; r++) {
+    const item = logsToRevert[r];
+    let tagihanRowIndex = -1;
+
+    for (let j = 1; j < tagihanData.length; j++) {
+      if (tagihanData[j][idxTglId].toString().trim() === item.idTagihan) {
+        tagihanRowIndex = j + 1; // 1-indexed
+        break;
+      }
+    }
+
+    if (tagihanRowIndex !== -1) {
+      const nominalTagihan = Number(tagihanData[tagihanRowIndex - 1][idxTglNominal]) || 0;
+      const bayarSekarang = Number(tagihanData[tagihanRowIndex - 1][idxTglBayar]) || 0;
+      
+      const revertedJumlahBayar = Math.max(0, bayarSekarang - item.jumlahBayar);
+      const revertedSisaTunggakan = nominalTagihan - revertedJumlahBayar;
+      
+      let statusBaru = "Belum Bayar";
+      if (revertedJumlahBayar === 0) {
+        statusBaru = "Belum Bayar";
+      } else if (revertedSisaTunggakan > 0) {
+        statusBaru = "Mencicil";
+      } else {
+        statusBaru = "Lunas";
+      }
+
+      // Write changes
+      sheetTagihan.getRange(tagihanRowIndex, idxTglBayar + 1).setValue(revertedJumlahBayar);
+      sheetTagihan.getRange(tagihanRowIndex, idxTglSisa + 1).setValue(revertedSisaTunggakan);
+      sheetTagihan.getRange(tagihanRowIndex, idxTglStatus + 1).setValue(statusBaru);
+      if (revertedJumlahBayar === 0) {
+        sheetTagihan.getRange(tagihanRowIndex, headerTagihan.indexOf("Tanggal_Terakhir_Bayar") + 1).setValue("");
+      }
+    }
+  }
+
+  // 3. Hapus baris log dari Log_Pembayaran (dari baris paling bawah ke atas agar index tidak bergeser)
+  logsToRevert.sort((a, b) => b.rowIndex - a.rowIndex);
+  for (let k = 0; k < logsToRevert.length; k++) {
+    sheetLog.deleteRow(logsToRevert[k].rowIndex);
+  }
+
+  return "Sukses membatalkan kuitansi " + noKuitansi + ". Sisa tunggakan tagihan telah dipulihkan.";
 }
 
 
@@ -386,6 +498,89 @@ function terbilang(angka) {
     temp = terbilang(Math.floor(angka / 1000000)) + " Juta" + terbilang(angka % 1000000);
   }
   return temp.trim();
+}
+
+
+/**
+ * ==============================================================================
+ * E. WEB SERVICE ENDPOINT (API INTERFACE & CONFORMANCE PING)
+ * Untuk pengujian koneksi asinkron (cek koneksi) dan sinkronisasi eksternal.
+ * ==============================================================================
+ */
+function doGet(e) {
+  return HtmlService.createHtmlOutput(
+    "<style>" +
+    "body { font-family: 'Segoe UI', system-ui, sans-serif; background: #f1f5f9; padding: 40px; color: #1e293b; text-align: center; }" +
+    "div { background: white; padding: 40px; border-radius: 12px; display: inline-block; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); border: 1px solid #e2e8f0; max-width: 500px; }" +
+    "h1 { color: #059669; font-size: 28px; margin-bottom: 8px; }" +
+    "p { margin: 8px 0; font-size: 14px; color: #64748b; }" +
+    ".success-badge { background: #d1fae5; color: #065f46; padding: 4px 12px; border-radius: 9999px; font-weight: bold; font-size: 11px; text-transform: uppercase; display: inline-block; margin-bottom: 20px; }" +
+    "</style>" +
+    "<div>" +
+    "  <span class='success-badge'>🔌 KONEKSI AKTIF</span>" +
+    "  <h1>Apps Script Berhasil Terhubung!</h1>" +
+    "  <p>Format URL Web App Google Apps Script Anda VALID dan sistem siap menerima permintaan.</p>" +
+    "  <p style='margin-top: 20px; font-weight: 600; color: #334155;'>Sistem Administrasi SPP & Keuangan Sekolah</p>" +
+    "</div>"
+  );
+}
+
+function doPost(e) {
+  var response = {};
+  try {
+    var postData = JSON.parse(e.postData.contents);
+    var action = postData.action;
+
+    if (action === "ping" || action === "test") {
+      var activeSpreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+      response = {
+        success: true,
+        message: "Pong! Google Sheets terhubung dengan aman dan responsif.",
+        timestamp: new Date().toISOString(),
+        spreadsheetName: activeSpreadsheet ? activeSpreadsheet.getName() : "Unknown Spreadsheet"
+      };
+    } else if (action === "generate") {
+      generateBulananTagihan(postData.bulanTahun);
+      response = {
+        success: true,
+        message: "Sukses menggenerasi tagihan periode: " + postData.bulanTahun
+      };
+    } else if (action === "prosesBayar") {
+      var hash = prosesPembayaran(
+        postData.nisn,
+        postData.idTagihan,
+        postData.jumlahBayar,
+        postData.metodeBayar,
+        postData.penerima,
+        postData.keterangan,
+        postData.tanggalManual
+      );
+      response = {
+        success: true,
+        message: "Sukses memproses entri pembayaran.",
+        data: hash
+      };
+    } else if (action === "voidKuitansi") {
+      var statusMsg = voidPembayaran(postData.noKuitansi);
+      response = {
+        success: true,
+        message: statusMsg
+      };
+    } else {
+      response = {
+        success: false,
+        message: "Action '" + action + "' tidak dikenali di server."
+      };
+    }
+  } catch (err) {
+    response = {
+      success: false,
+      message: "Gagal memproses request: " + err.toString()
+    };
+  }
+
+  return ContentService.createTextOutput(JSON.stringify(response))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 `;
 export const appsScriptGuideMarkdown = `### Panduan Struktur Kolom Basis Data Google Sheets
