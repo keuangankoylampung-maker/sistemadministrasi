@@ -1,0 +1,6 @@
+{
+  "name": "Sistem Administrasi SPP & Biaya Sekolah",
+  "description": "Sistem admin penerimaan SPP dan biaya sekolah kustom tingkat SMP/SMA dengan integrasi Google Sheets & Apps Script.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
